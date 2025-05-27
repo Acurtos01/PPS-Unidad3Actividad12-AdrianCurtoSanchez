@@ -121,7 +121,7 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 // Conexión
-$conn = new mysqli("database", "root", "MiContraseña", "SQLi"); 
+$conn = new mysqli("database", "root", "tiger", "SQLi"); 
 // ← Usa "localhost" si no estás en Docker
 if ($conn->connect_error) {
     die("Conexión fallida: " . $conn->connect_error);
@@ -166,7 +166,7 @@ $conn->close();
 </form>
 ```
 
-Si accedemos a la URL http://localhost/add_user.php crearemos un nuevo usuario en la base de datos con la contraseña hasheada.
+Si accedemos a la URL http://localhost/broke_authentication/add_user.php crearemos un nuevo usuario en la base de datos con la contraseña hasheada.
 
 
 Podemos comprobarlo desde phpmyadmin en http://localhost:8080.
@@ -286,3 +286,156 @@ ALTER TABLE usuarios ADD last_attempt TIMESTAMP NULL DEFAULT NULL;
 ```
 
 ## Implementar autenticación multifactor (MFA)
+
+### 1. Modificación en la Base de Datos
+
+En la base de datos ejecutamos el siguiente código SQL:
+
+```
+USE SQLi;
+ALTER TABLE usuarios ADD mfa_code VARCHAR (6) DEFAULT 0;
+ALTER TABLE usuarios ADD mfa_expires TIMESTAMP NULL DEFAULT NULL;
+```
+
+![alt text](images/mfasql.png)
+
+### 2. login_weak4.php (login + generación del código)
+
+Crea el archivo `login_weak4.php` con el siguiente contenido (recuerda cambiar la contraseña):
+
+```
+<?php
+$conn = new mysqli("database", "root", "MyPassword", "SQLi");
+if ($conn->connect_error) {
+    die("Error de conexión: " . $conn->connect_error);
+}
+
+session_start();
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $username = $_POST["username"];
+    $password = $_POST["password"];
+
+    $query = "SELECT contrasenya FROM usuarios WHERE usuario = ?";
+    $stmt = $conn->prepare($query);
+    $stmt->bind_param("s", $username);
+    $stmt->execute();
+    $stmt->store_result();
+
+    if ($stmt->num_rows > 0) {
+        $stmt->bind_result($hashed_password);
+        $stmt->fetch();
+
+        if (password_verify($password, $hashed_password)) {
+            // ✅ Login correcto - generar MFA
+            $mfa_code = strval(rand(100000, 999999));
+            $expires = (new DateTime('+5 minutes'))->format('Y-m-d H:i:s');
+
+            // Guardar código MFA
+            $update = $conn->prepare("UPDATE usuarios SET mfa_code = ?, mfa_expires = ? WHERE usuario = ?");
+            $update->bind_param("sss", $mfa_code, $expires, $username);
+            $update->execute();
+
+            // Guardar usuario en sesión para MFA
+            $_SESSION["mfa_user"] = $username;
+
+            // Redirigir a mostrar el código y luego a verificación
+            header("Location: mostrar_codigo.php?code=$mfa_code");
+            exit();
+        } else {
+            echo "❌ Contraseña incorrecta.";
+        }
+    } else {
+        echo "❌ Usuario no encontrado.";
+    }
+    $stmt->close();
+}
+$conn->close();
+?>
+
+<form method="post">
+    <input type="text" name="username" placeholder="Usuario" required>
+    <input type="password" name="password" placeholder="Contraseña" required>
+    <button type="submit">Iniciar sesión</button>
+</form>
+
+```
+
+### 3. mostrar_codigo.php
+
+Creamos el archivo `mostrar_codigo.php` con el que visualizaremos el código enviado. Esto simula el ver el código en el email.
+
+```
+<?php
+$code = $_GET["code"] ?? "XXXXXX";
+echo "<h2>🔐 Tu código MFA es: <strong>$code</strong></h2>";
+echo "<a href='verificar_mfa.php'>Ir a verificación MFA</a>";
+?>
+```
+
+### 4. verificar_mfa.php (verificación del código)ç
+
+Creamos el archivo `verificar_mfa.php` que nos indicará si el código introducido es correcto (recuerda cambiar la contraseña).
+
+```
+<?php
+session_start();
+$conn = new mysqli("database", "root", "tiger", "SQLi");
+if ($conn->connect_error) {
+    die("Error de conexión: " . $conn->connect_error);
+}
+
+if (!isset($_SESSION["mfa_user"])) {
+    die("⚠️ No hay sesión activa para MFA.");
+}
+
+$username = $_SESSION["mfa_user"];
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $code_input = $_POST["mfa_code"];
+
+    $query = "SELECT mfa_code, mfa_expires FROM usuarios WHERE usuario = ?";
+    $stmt = $conn->prepare($query);
+    $stmt->bind_param("s", $username);
+    $stmt->execute();
+    $stmt->bind_result($mfa_code, $mfa_expires);
+    $stmt->fetch();
+
+    $now = new DateTime();
+    $expires_time = new DateTime($mfa_expires);
+
+    if ($code_input == $mfa_code && $now < $expires_time) {
+        echo "✅ Autenticación multifactor exitosa. Bienvenido, $username.";
+
+        // Limpieza del código MFA
+        $clear = $conn->prepare("UPDATE usuarios SET mfa_code = NULL, mfa_expires = NULL WHERE usuario = ?");
+        $clear->bind_param("s", $username);
+        $clear->execute();
+
+        session_destroy(); // o puedes mantener sesión como autenticado
+    } else {
+        echo "❌ Código incorrecto o expirado.";
+    }
+    $stmt->close();
+}
+$conn->close();
+?>
+
+<form method="post">
+    <input type="text" name="mfa_code" placeholder="Código MFA" required>
+    <button type="submit">Verificar Código</button>
+</form>
+
+```
+
+### Prueba
+
+Accedemos a la URL http://localhost/broke_authentication/login_weak4.php e introducimos las credenciales del usuario con la contraseña hasheada.
+
+Copiamos el código que nos genera y pinchamos en el enlace de verificación.
+
+![alt text](images/mfa-code.png)
+
+Si el código es correcto nos indicará que la operación es correcta.
+
+![alt text](images/mfa-code-verify.png) 
